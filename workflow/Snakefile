@@ -1,0 +1,124 @@
+configfile: "config/config.yaml"
+
+import pandas as pd
+
+samples = pd.read_csv("samples.tsv", sep="\t")
+
+####################################################
+# FINAL TARGETS
+####################################################
+
+rule all:
+    input:
+        expand(
+            "results/fastqc/{sample}_1_fastqc.html",
+            sample=samples["sample"]
+        ),
+
+        expand(
+            "results/fastqc/{sample}_2_fastqc.html",
+            sample=samples["sample"]
+        ),
+
+        expand(
+            "data/trimmed/{sample}_1_paired.fastq.gz",
+            sample=samples["sample"]
+        ),
+
+        expand(
+            "data/trimmed/{sample}_2_paired.fastq.gz",
+            sample=samples["sample"]
+        ),
+
+        expand(
+            "data/bam/{sample}.sorted.bam",
+            sample=samples["sample"]
+        )
+        
+
+####################################################
+# FASTQC
+####################################################
+
+rule fastqc:
+    input:
+        R1=lambda wc: samples.loc[samples["sample"] == wc.sample, "R1"].values[0],
+        R2=lambda wc: samples.loc[samples["sample"] == wc.sample, "R2"].values[0]
+
+    output:
+        html1="results/fastqc/{sample}_1_fastqc.html",
+        html2="results/fastqc/{sample}_2_fastqc.html"
+
+    threads: 2
+
+    shell:
+        """
+        fastqc {input.R1} {input.R2} --outdir results/fastqc
+        """
+
+
+####################################################
+# TRIMMOMATIC
+####################################################
+
+rule trim:
+    input:
+        R1=lambda wc: samples.loc[
+            samples["sample"] == wc.sample, "R1"
+        ].values[0],
+
+        R2=lambda wc: samples.loc[
+            samples["sample"] == wc.sample, "R2"
+        ].values[0]
+
+    output:
+        R1_paired="data/trimmed/{sample}_1_paired.fastq.gz",
+        R1_unpaired="data/trimmed/{sample}_1_unpaired.fastq.gz",
+
+        R2_paired="data/trimmed/{sample}_2_paired.fastq.gz",
+        R2_unpaired="data/trimmed/{sample}_2_unpaired.fastq.gz"
+
+    threads:
+        config["threads"]["trimmomatic"]
+
+    shell:
+        """
+        trimmomatic PE \
+        -threads {threads} \
+        {input.R1} {input.R2} \
+        {output.R1_paired} {output.R1_unpaired} \
+        {output.R2_paired} {output.R2_unpaired} \
+        ILLUMINACLIP:{config[trimmomatic][adapters]}:2:30:10 \
+        LEADING:3 \
+        TRAILING:3 \
+        SLIDINGWINDOW:4:20 \
+        MINLEN:36
+        """
+
+
+
+####################################################
+# BWA ALIGNMENT + SORTING
+####################################################
+
+rule bwa_mem:
+    input:
+        R1="data/trimmed/{sample}_1_paired.fastq.gz",
+        R2="data/trimmed/{sample}_2_paired.fastq.gz",
+        ref=config["reference"]
+
+    output:
+        bam="data/bam/{sample}.sorted.bam"
+
+    threads:
+        config["threads"]["bwa"]
+
+    shell:
+        """
+        bwa mem -t {threads} {input.ref} \
+        {input.R1} {input.R2} | \
+        samtools sort -@ {threads} \
+        -o {output.bam}
+
+        samtools index {output.bam}
+        """

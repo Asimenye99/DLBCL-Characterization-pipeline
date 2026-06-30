@@ -1,0 +1,28 @@
+# Snakemake
+.snakemake/
+
+# Results
+results/
+logs/
+
+# Raw sequencing data
+data/raw/
+data/trimmed/
+data/bam/
+data/dedup/
+data/gvcf/
+data/vcf/
+
+# Annotation
+annotation/
+
+# Reference genome
+reference/
+
+# Python
+__pycache__/
+*.pyc
+
+# Conda
+*.tar.gz
+.env
