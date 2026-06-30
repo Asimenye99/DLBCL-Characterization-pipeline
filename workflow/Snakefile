@@ -1,124 +1,245 @@
-configfile: "config/config.yaml"
-
 import pandas as pd
+
+configfile: "config/config.yaml"
 
 samples = pd.read_csv("samples.tsv", sep="\t")
 
-####################################################
+SAMPLES = samples["sample"].tolist()
+
+############################################################
 # FINAL TARGETS
-####################################################
+############################################################
 
 rule all:
     input:
-        expand(
-            "results/fastqc/{sample}_1_fastqc.html",
-            sample=samples["sample"]
-        ),
+        "results/multiqc/multiqc_report.html",
+        expand("results/bam/{sample}.marked.bam", sample=SAMPLES),
+        expand("results/vcf/{sample}.g.vcf.gz", sample=SAMPLES),
+        "results/joint/cohort.vcf.gz",
+        "results/joint/cohort.filtered.vcf.gz",
+        "results/annotation/cohort.vep.vcf",
+        "results/annotation/pathogenic_variants.tsv"
 
-        expand(
-            "results/fastqc/{sample}_2_fastqc.html",
-            sample=samples["sample"]
-        ),
-
-        expand(
-            "data/trimmed/{sample}_1_paired.fastq.gz",
-            sample=samples["sample"]
-        ),
-
-        expand(
-            "data/trimmed/{sample}_2_paired.fastq.gz",
-            sample=samples["sample"]
-        ),
-
-        expand(
-            "data/bam/{sample}.sorted.bam",
-            sample=samples["sample"]
-        )
-        
-
-####################################################
-# FASTQC
-####################################################
+############################################################
+# 1. FASTQC
+############################################################
 
 rule fastqc:
     input:
         R1=lambda wc: samples.loc[samples["sample"] == wc.sample, "R1"].values[0],
         R2=lambda wc: samples.loc[samples["sample"] == wc.sample, "R2"].values[0]
-
     output:
-        html1="results/fastqc/{sample}_1_fastqc.html",
-        html2="results/fastqc/{sample}_2_fastqc.html"
-
-    threads: 2
-
+        "results/fastqc/{sample}_1.html",
+        "results/fastqc/{sample}_2.html"
+    threads: config["threads"]["fastqc"]
     shell:
         """
-        fastqc {input.R1} {input.R2} --outdir results/fastqc
+        mkdir -p results/fastqc
+        fastqc {input.R1} {input.R2} -o results/fastqc
         """
 
-
-####################################################
-# TRIMMOMATIC
-####################################################
+############################################################
+# 2. TRIMMING
+############################################################
 
 rule trim:
     input:
-        R1=lambda wc: samples.loc[
-            samples["sample"] == wc.sample, "R1"
-        ].values[0],
-
-        R2=lambda wc: samples.loc[
-            samples["sample"] == wc.sample, "R2"
-        ].values[0]
-
+        R1=lambda wc: samples.loc[samples["sample"] == wc.sample, "R1"].values[0],
+        R2=lambda wc: samples.loc[samples["sample"] == wc.sample, "R2"].values[0]
     output:
-        R1_paired="data/trimmed/{sample}_1_paired.fastq.gz",
-        R1_unpaired="data/trimmed/{sample}_1_unpaired.fastq.gz",
-
-        R2_paired="data/trimmed/{sample}_2_paired.fastq.gz",
-        R2_unpaired="data/trimmed/{sample}_2_unpaired.fastq.gz"
-
-    threads:
-        config["threads"]["trimmomatic"]
-
+        R1_paired="results/trim/{sample}_1.paired.fastq.gz",
+        R1_unpaired="results/trim/{sample}_1.unpaired.fastq.gz",
+        R2_paired="results/trim/{sample}_2.paired.fastq.gz",
+        R2_unpaired="results/trim/{sample}_2.unpaired.fastq.gz"
+    threads: config["threads"]["trimmomatic"]
     shell:
         """
-        trimmomatic PE \
-        -threads {threads} \
+        mkdir -p results/trim
+
+        trimmomatic PE -threads {threads} \
         {input.R1} {input.R2} \
         {output.R1_paired} {output.R1_unpaired} \
         {output.R2_paired} {output.R2_unpaired} \
-        ILLUMINACLIP:{config[trimmomatic][adapters]}:2:30:10 \
-        LEADING:3 \
-        TRAILING:3 \
-        SLIDINGWINDOW:4:20 \
-        MINLEN:36
+        ILLUMINACLIP:{config["trimmomatic"]["adapters"]}:2:30:10 \
+        LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:36
         """
 
+############################################################
+# 3. BWA ALIGNMENT
+############################################################
 
-
-####################################################
-# BWA ALIGNMENT + SORTING
-####################################################
-
-rule bwa_mem:
+rule bwa:
     input:
-        R1="data/trimmed/{sample}_1_paired.fastq.gz",
-        R2="data/trimmed/{sample}_2_paired.fastq.gz",
-        ref=config["reference"]
-
+        ref=config["reference"],
+        R1="results/trim/{sample}_1.paired.fastq.gz",
+        R2="results/trim/{sample}_2.paired.fastq.gz"
     output:
-        bam="data/bam/{sample}.sorted.bam"
-
-    threads:
-        config["threads"]["bwa"]
-
+        "results/bam/{sample}.bam"
+    threads: config["threads"]["bwa"]
     shell:
         """
-        bwa mem -t {threads} {input.ref} \
-        {input.R1} {input.R2} | \
-        samtools sort -@ {threads} \
-        -o {output.bam}
+        mkdir -p results/bam
+
+        bwa mem -t {threads} {input.ref} {input.R1} {input.R2} | \
+        samtools view -Sb - > {output}
+        """
+
+############################################################
+# 4. SORT BAM
+############################################################
+
+rule sort_bam:
+    input:
+        "results/bam/{sample}.bam"
+    output:
+        "results/bam/{sample}.sorted.bam"
+    shell:
+        """
+        samtools sort -o {output} {input}
+        samtools index {output}
+        """
+
+############################################################
+# 5. MARK DUPLICATES (GATK)
+############################################################
+
+rule mark_duplicates:
+    input:
+        "results/bam/{sample}.sorted.bam"
+    output:
+        bam="results/bam/{sample}.marked.bam",
+        metrics="results/bam/{sample}.metrics.txt"
+    shell:
+        """
+        gatk MarkDuplicates \
+        -I {input} \
+        -O {output.bam} \
+        -M {output.metrics}
 
         samtools index {output.bam}
+        """
+
+############################################################
+# 6. HAPLOTYPE CALLER → GVCF
+############################################################
+
+rule haplotype_caller:
+    input:
+        bam="results/bam/{sample}.marked.bam",
+        ref=config["reference"]
+    output:
+        "results/vcf/{sample}.g.vcf.gz"
+    threads: config["threads"]["gatk"]
+    shell:
+        """
+        gatk HaplotypeCaller \
+        -R {input.ref} \
+        -I {input.bam} \
+        -O {output} \
+        -ERC GVCF
+        """
+
+############################################################
+# 7. COMBINE GVCFs
+############################################################
+
+rule combine_gvcfs:
+    input:
+        expand("results/vcf/{sample}.g.vcf.gz", sample=SAMPLES)
+    output:
+        "results/joint/cohort.g.vcf.gz"
+    shell:
+        """
+        gatk CombineGVCFs \
+        -R {config[reference]} \
+        { ' '.join(['--variant ' + x for x in input]) } \
+        -O {output}
+        """
+
+############################################################
+# 8. JOINT GENOTYPING
+############################################################
+
+rule joint_genotyping:
+    input:
+        "results/joint/cohort.g.vcf.gz"
+    output:
+        "results/joint/cohort.vcf.gz"
+    shell:
+        """
+        gatk GenotypeGVCFs \
+        -R {config[reference]} \
+        -V {input} \
+        -O {output}
+        """
+
+############################################################
+# 9. VARIANT FILTERING
+############################################################
+
+rule variant_filter:
+    input:
+        "results/joint/cohort.vcf.gz"
+    output:
+        "results/joint/cohort.filtered.vcf.gz"
+    shell:
+        """
+        gatk VariantFiltration \
+        -R {config[reference]} \
+        -V {input} \
+        -O {output} \
+        --filter-expression "QD < 2.0 || FS > 60.0 || MQ < 40.0" \
+        --filter-name "basic_filter"
+        """
+
+############################################################
+# 10. VEP ANNOTATION
+############################################################
+
+rule vep:
+    input:
+        "results/joint/cohort.filtered.vcf.gz"
+    output:
+        "results/annotation/cohort.vep.vcf"
+    shell:
+        """
+        vep -i {input} \
+        -o {output} \
+        --vcf \
+        --symbol \
+        --cache \
+        --offline
+        """
+
+############################################################
+# 11. PATHOGENIC VARIANT EXTRACTION
+############################################################
+
+rule pathogenic:
+    input:
+        "results/annotation/cohort.vep.vcf"
+    output:
+        "results/annotation/pathogenic_variants.tsv"
+    run:
+        import pandas as pd
+
+        # simple extraction logic placeholder
+        with open(input[0]) as f:
+            lines = [l for l in f if "HIGH" in l or "MODERATE" in l]
+
+        with open(output[0], "w") as out:
+            out.write("\n".join(lines))
+
+############################################################
+# 12. MULTIQC
+############################################################
+
+rule multiqc:
+    input:
+        "results/fastqc/"
+    output:
+        "results/multiqc/multiqc_report.html"
+    shell:
+        """
+        multiqc results/ -o results/multiqc
         """
