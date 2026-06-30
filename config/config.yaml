@@ -8,4 +8,4 @@ threads:
   gatk: 4
 
 trimmomatic:
-  adapters: "/home/ndovie/miniconda3/envs/snakemake_env/share/trimmomatic/adapters/TruSeq3-PE.fa"
+  adapters: "reference/adapters/TruSeq3-PE.fa"
