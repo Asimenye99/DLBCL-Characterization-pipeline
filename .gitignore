@@ -1,11 +1,20 @@
+# ============================================================
 # Snakemake
+# ============================================================
 .snakemake/
+.snakemake_timestamp
 
-# Results
+# ============================================================
+# Results, logs, and benchmarks
+# ============================================================
 results/
 logs/
+benchmarks/
+*.log
 
-# Raw sequencing data
+# ============================================================
+# Raw sequencing and intermediate analysis data
+# ============================================================
 data/raw/
 data/trimmed/
 data/bam/
@@ -13,17 +22,48 @@ data/dedup/
 data/gvcf/
 data/vcf/
 
-# Annotation
+# ============================================================
+# Large reference resources
+# ============================================================
+reference/GRCh38.fa*
+reference/*.fasta*
+reference/germline/
+reference/homo_sapiens/
+reference/CADD/
+reference/REVEL/
+reference/AlphaMissense/
+reference/*.dict
+reference/clinvar/
+
+# ============================================================
+# Keep small adapter files needed by workflow
+# ============================================================
+!reference/adapters/
+!reference/adapters/*.fa
+
+# ============================================================
+# Large annotation databases
+# ============================================================
 annotation/
 
-# Reference genome
-reference/
-
+# ============================================================
 # Python
+# ============================================================
 __pycache__/
 *.pyc
 
-# Conda
+# ============================================================
+# Conda/environment files
+# ============================================================
 *.tar.gz
 .env
+
+# ============================================================
+# VEP/test files
+# ============================================================
 test.vep.vcf
+
+# ============================================================
+# Operating system files
+# ============================================================
+.DS_Store

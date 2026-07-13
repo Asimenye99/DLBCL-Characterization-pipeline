@@ -1,106 +1,184 @@
+import os
 import pandas as pd
 
 configfile: "config/config.yaml"
 
 samples = pd.read_csv("samples.tsv", sep="\t")
-
 SAMPLES = samples["sample"].tolist()
 
+
+def get_fastq(wc, read):
+    return samples.loc[samples["sample"] == wc.sample, read].values[0]
+
+
 ############################################################
-# FINAL TARGETS
+# ALL TARGETS
 ############################################################
 
 rule all:
     input:
-        "results/multiqc/multiqc_report.html",
         expand("results/bam/{sample}.marked.bam", sample=SAMPLES),
-        expand("results/vcf/{sample}.g.vcf.gz", sample=SAMPLES),
-        "results/joint/cohort.vcf.gz",
-        "results/joint/cohort.filtered.vcf.gz",
-        "results/annotation/cohort.vep.vcf",
-        "results/annotation/pathogenic_variants.tsv"
+        expand("results/mutect/{sample}.normalized.vcf.gz", sample=SAMPLES),
+        expand("results/mutect/{sample}.normalized.vcf.gz.tbi", sample=SAMPLES),
+        expand("results/annotation/{sample}.vep.vcf", sample=SAMPLES),
+        "results/prioritization/DLBCL_candidate_variants.tsv",
+        "results/proteins/protein_sequences_done.flag",
+        "results/mutant_proteins/mutant_sequences_done.flag",
+        "results/structure_inputs",
+        "results/multiqc/multiqc_report.html"
+
 
 ############################################################
-# 1. FASTQC
+# 0. REFERENCE INDEXING
+#    bwa index / .fai / .dict are prerequisites for
+#    alignment and GATK. Generated here so the pipeline
+#    is self-contained rather than assuming they pre-exist.
+############################################################
+
+rule bwa_index:
+    input:
+        config["reference"]
+    output:
+        config["reference"] + ".bwt",
+        config["reference"] + ".pac",
+        config["reference"] + ".ann",
+        config["reference"] + ".amb",
+        config["reference"] + ".sa"
+    log: "logs/bwa_index.log"
+    shell:
+        """
+        bwa index {input} > {log} 2>&1
+        """
+
+rule faidx:
+    input:
+        config["reference"]
+    output:
+        config["reference"] + ".fai"
+    log: "logs/faidx.log"
+    shell:
+        """
+        samtools faidx {input} > {log} 2>&1
+        """
+
+rule sequence_dict:
+    input:
+        config["reference"]
+    output:
+        os.path.splitext(config["reference"])[0] + ".dict"
+    log: "logs/sequence_dict.log"
+    shell:
+        """
+        gatk CreateSequenceDictionary -R {input} -O {output} > {log} 2>&1
+        """
+
+
+############################################################
+# 1. RAW READ QUALITY CONTROL
 ############################################################
 
 rule fastqc:
     input:
-        R1=lambda wc: samples.loc[samples["sample"] == wc.sample, "R1"].values[0],
-        R2=lambda wc: samples.loc[samples["sample"] == wc.sample, "R2"].values[0]
+        R1=lambda wc: get_fastq(wc, "R1"),
+        R2=lambda wc: get_fastq(wc, "R2")
     output:
-        "results/fastqc/{sample}_1.html",
-        "results/fastqc/{sample}_2.html"
+        html1="results/fastqc/{sample}_1_fastqc.html",
+        zip1="results/fastqc/{sample}_1_fastqc.zip",
+        html2="results/fastqc/{sample}_2_fastqc.html",
+        zip2="results/fastqc/{sample}_2_fastqc.zip"
     threads: config["threads"]["fastqc"]
+    log: "logs/fastqc/{sample}.log"
     shell:
         """
-        mkdir -p results/fastqc
-        fastqc {input.R1} {input.R2} -o results/fastqc
+        mkdir -p results/fastqc logs/fastqc
+        fastqc {input.R1} {input.R2} -t {threads} -o results/fastqc > {log} 2>&1
         """
 
+
 ############################################################
-# 2. TRIMMING
+# 2. READ TRIMMING
 ############################################################
 
 rule trim:
     input:
-        R1=lambda wc: samples.loc[samples["sample"] == wc.sample, "R1"].values[0],
-        R2=lambda wc: samples.loc[samples["sample"] == wc.sample, "R2"].values[0]
+        R1=lambda wc: get_fastq(wc, "R1"),
+        R2=lambda wc: get_fastq(wc, "R2")
     output:
-        R1_paired="results/trim/{sample}_1.paired.fastq.gz",
-        R1_unpaired="results/trim/{sample}_1.unpaired.fastq.gz",
-        R2_paired="results/trim/{sample}_2.paired.fastq.gz",
-        R2_unpaired="results/trim/{sample}_2.unpaired.fastq.gz"
+        R1="results/trim/{sample}_1.paired.fastq.gz",
+        R2="results/trim/{sample}_2.paired.fastq.gz",
+        R1_unpaired=temp("results/trim/{sample}_1.unpaired.fastq.gz"),
+        R2_unpaired=temp("results/trim/{sample}_2.unpaired.fastq.gz")
     threads: config["threads"]["trimmomatic"]
+    resources:
+        mem_mb=32000
+    log: "logs/trim/{sample}.log"
     shell:
         """
-        mkdir -p results/trim
+        mkdir -p results/trim logs/trim
+        export JAVA_TOOL_OPTIONS="-Xmx32G"
 
         trimmomatic PE -threads {threads} \
-        {input.R1} {input.R2} \
-        {output.R1_paired} {output.R1_unpaired} \
-        {output.R2_paired} {output.R2_unpaired} \
-        ILLUMINACLIP:{config["trimmomatic"]["adapters"]}:2:30:10 \
-        LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:36
+            {input.R1} {input.R2} \
+            {output.R1} {output.R1_unpaired} \
+            {output.R2} {output.R2_unpaired} \
+            ILLUMINACLIP:{config[trimmomatic][adapters]}:2:30:10 \
+            LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:36 \
+            > {log} 2>&1
         """
 
 ############################################################
-# 3. BWA ALIGNMENT
+# 3. QUALITY CONTROL AFTER TRIMMING
 ############################################################
 
-rule bwa:
+rule fastqc_trimmed:
     input:
-        ref=config["reference"],
         R1="results/trim/{sample}_1.paired.fastq.gz",
         R2="results/trim/{sample}_2.paired.fastq.gz"
     output:
-        "results/bam/{sample}.bam"
-    threads: config["threads"]["bwa"]
+        html1="results/fastqc_trimmed/{sample}_1.paired_fastqc.html",
+        zip1="results/fastqc_trimmed/{sample}_1.paired_fastqc.zip",
+        html2="results/fastqc_trimmed/{sample}_2.paired_fastqc.html",
+        zip2="results/fastqc_trimmed/{sample}_2.paired_fastqc.zip"
+    threads: config["threads"]["fastqc"]
+    log: "logs/fastqc_trimmed/{sample}.log"
     shell:
         """
-        mkdir -p results/bam
-
-        bwa mem -t {threads} {input.ref} {input.R1} {input.R2} | \
-        samtools view -Sb - > {output}
+        mkdir -p results/fastqc_trimmed logs/fastqc_trimmed
+        fastqc {input.R1} {input.R2} -t {threads} -o results/fastqc_trimmed > {log} 2>&1
         """
 
+
 ############################################################
-# 4. SORT BAM
+# 4. BWA-MEM ALIGNMENT + SORTING
+#    Produces sorted BAM directly; adds read groups
+#    required by GATK
 ############################################################
 
-rule sort_bam:
+rule align_sort:
     input:
-        "results/bam/{sample}.bam"
+        ref=config["reference"],
+        bwt=config["reference"] + ".bwt",
+        R1="results/trim/{sample}_1.paired.fastq.gz",
+        R2="results/trim/{sample}_2.paired.fastq.gz"
     output:
-        "results/bam/{sample}.sorted.bam"
+        bam="results/bam/{sample}.sorted.bam",
+        bai="results/bam/{sample}.sorted.bam.bai"
+    threads: config["threads"]["bwa"]
+    log: "logs/bwa/{sample}.log"
+    benchmark: "benchmarks/bwa/{sample}.txt"
+    params:
+        rg=lambda wc: f"@RG\\tID:{wc.sample}\\tSM:{wc.sample}\\tPL:ILLUMINA\\tLB:{wc.sample}"
     shell:
         """
-        samtools sort -o {output} {input}
-        samtools index {output}
+        mkdir -p results/bam logs/bwa
+        bwa mem -t {threads} -R '{params.rg}' {input.ref} {input.R1} {input.R2} 2> {log} \
+            | samtools sort -@ {threads} -o {output.bam}
+        samtools index {output.bam}
         """
 
+
 ############################################################
-# 5. MARK DUPLICATES (GATK)
+# 5. MARK DUPLICATES
 ############################################################
 
 rule mark_duplicates:
@@ -108,138 +186,317 @@ rule mark_duplicates:
         "results/bam/{sample}.sorted.bam"
     output:
         bam="results/bam/{sample}.marked.bam",
+        bai="results/bam/{sample}.marked.bam.bai",
         metrics="results/bam/{sample}.metrics.txt"
+    log: "logs/markduplicates/{sample}.log"
     shell:
         """
-        gatk MarkDuplicates \
-        -I {input} \
-        -O {output.bam} \
-        -M {output.metrics}
-
+        mkdir -p logs/markduplicates
+        gatk MarkDuplicates -I {input} -O {output.bam} -M {output.metrics} > {log} 2>&1
         samtools index {output.bam}
         """
 
+
 ############################################################
-# 6. HAPLOTYPE CALLER → GVCF
+# 6. MUTECT2 SOMATIC VARIANT CALLING (TUMOR ONLY)
+#    Designed for DLBCL tumor samples without matched normal
 ############################################################
 
-rule haplotype_caller:
+rule mutect2:
     input:
         bam="results/bam/{sample}.marked.bam",
-        ref=config["reference"]
+        bai="results/bam/{sample}.marked.bam.bai",
+        ref=config["reference"],
+        fai=config["reference"] + ".fai",
+        seq_dict=os.path.splitext(config["reference"])[0] + ".dict",
+        germline=config["germline_resource"]
     output:
-        "results/vcf/{sample}.g.vcf.gz"
+        vcf="results/mutect/{sample}.unfiltered.vcf.gz",
+        f1r2="results/mutect/{sample}.f1r2.tar.gz"
     threads: config["threads"]["gatk"]
+    log: "logs/mutect2/{sample}.log"
+    benchmark: "benchmarks/mutect2/{sample}.txt"
+    params:
+        pon=lambda wc: (
+            f"--panel-of-normals {config['panel_of_normals']}"
+            if config.get("panel_of_normals") else ""
+        )
     shell:
         """
-        gatk HaplotypeCaller \
-        -R {input.ref} \
-        -I {input.bam} \
-        -O {output} \
-        -ERC GVCF
+        mkdir -p results/mutect logs/mutect2
+        gatk Mutect2 \
+            -R {input.ref} \
+            -I {input.bam} \
+            --germline-resource {input.germline} \
+            {params.pon} \
+            --f1r2-tar-gz {output.f1r2} \
+            --native-pair-hmm-threads {threads} \
+            -O {output.vcf} \
+            > {log} 2>&1
         """
 
+
 ############################################################
-# 7. COMBINE GVCFs
+# 7. LEARN READ ORIENTATION ARTIFACT MODEL
 ############################################################
 
-rule combine_gvcfs:
+rule orientation_model:
     input:
-        expand("results/vcf/{sample}.g.vcf.gz", sample=SAMPLES)
+        "results/mutect/{sample}.f1r2.tar.gz"
     output:
-        "results/joint/cohort.g.vcf.gz"
+        "results/mutect/{sample}.read-orientation-model.tar.gz"
+    log: "logs/mutect2/{sample}.orientation.log"
     shell:
         """
-        gatk CombineGVCFs \
-        -R {config[reference]} \
-        { ' '.join(['--variant ' + x for x in input]) } \
-        -O {output}
+        gatk LearnReadOrientationModel -I {input} -O {output} > {log} 2>&1
         """
 
+
 ############################################################
-# 8. JOINT GENOTYPING
+# 8. CONTAMINATION ESTIMATION
 ############################################################
 
-rule joint_genotyping:
+rule get_pileup_summaries:
     input:
-        "results/joint/cohort.g.vcf.gz"
+        bam="results/bam/{sample}.marked.bam",
+        bai="results/bam/{sample}.marked.bam.bai",
+        variants=config["common_variants"]
     output:
-        "results/joint/cohort.vcf.gz"
+        "results/mutect/{sample}.pileups.table"
+    log: "logs/mutect2/{sample}.pileup.log"
     shell:
         """
-        gatk GenotypeGVCFs \
-        -R {config[reference]} \
-        -V {input} \
-        -O {output}
+        gatk GetPileupSummaries \
+            -I {input.bam} \
+            -V {input.variants} \
+            -L {input.variants} \
+            -O {output} \
+            > {log} 2>&1
         """
 
-############################################################
-# 9. VARIANT FILTERING
-############################################################
 
-rule variant_filter:
+rule calculate_contamination:
     input:
-        "results/joint/cohort.vcf.gz"
+        "results/mutect/{sample}.pileups.table"
     output:
-        "results/joint/cohort.filtered.vcf.gz"
+        contamination="results/mutect/{sample}.contamination.table",
+        segments="results/mutect/{sample}.segments.table"
+    log: "logs/mutect2/{sample}.contamination.log"
     shell:
         """
-        gatk VariantFiltration \
-        -R {config[reference]} \
-        -V {input} \
-        -O {output} \
-        --filter-expression "QD < 2.0 || FS > 60.0 || MQ < 40.0" \
-        --filter-name "basic_filter"
+        gatk CalculateContamination \
+            -I {input} \
+            -O {output.contamination} \
+            --tumor-segmentation {output.segments} \
+            > {log} 2>&1
         """
 
+
 ############################################################
-# 10. VEP ANNOTATION
+# 9. FILTER SOMATIC VARIANTS
+############################################################
+
+rule filter_mutect:
+    input:
+        vcf="results/mutect/{sample}.unfiltered.vcf.gz",
+        ref=config["reference"],
+        fai=config["reference"] + ".fai",
+        seq_dict=os.path.splitext(config["reference"])[0] + ".dict",
+        contamination="results/mutect/{sample}.contamination.table",
+        segments="results/mutect/{sample}.segments.table",
+        orientation="results/mutect/{sample}.read-orientation-model.tar.gz"
+    output:
+        "results/mutect/{sample}.filtered.vcf.gz"
+    log: "logs/mutect2/{sample}.filter.log"
+    shell:
+        """
+        gatk FilterMutectCalls \
+            -R {input.ref} \
+            -V {input.vcf} \
+            --contamination-table {input.contamination} \
+            --tumor-segmentation {input.segments} \
+            --ob-priors {input.orientation} \
+            -O {output} \
+            > {log} 2>&1
+        """
+
+
+############################################################
+# 10. NORMALIZE VARIANTS
+#     Important before VEP annotation
+############################################################
+
+rule normalize_vcf:
+    input:
+        vcf="results/mutect/{sample}.filtered.vcf.gz",
+        ref=config["reference"],
+        fai=config["reference"] + ".fai"
+    output:
+        vcf="results/mutect/{sample}.normalized.vcf.gz",
+        tbi="results/mutect/{sample}.normalized.vcf.gz.tbi"
+    log: "logs/bcftools/{sample}.norm.log"
+    shell:
+        """
+        mkdir -p logs/bcftools
+        bcftools norm -f {input.ref} -m -both {input.vcf} -Oz -o {output.vcf} > {log} 2>&1
+        tabix -p vcf {output.vcf}
+        """
+
+
+############################################################
+# 11. VEP ANNOTATION
+#     Adds: gene symbol, transcript consequence, ClinVar,
+#     CADD, REVEL, AlphaMissense
 ############################################################
 
 rule vep:
     input:
-        "results/joint/cohort.filtered.vcf.gz"
+        "results/mutect/{sample}.normalized.vcf.gz"
     output:
-        "results/annotation/cohort.vep.vcf"
+        vcf="results/annotation/{sample}.vep.vcf",
+        stats="results/annotation/{sample}.vep_summary.html"
+    threads: config["threads"]["vep"]
+    log: "logs/vep/{sample}.log"
+    benchmark: "benchmarks/vep/{sample}.txt"
+    params:
+        clinvar=config["vep_plugins"]["clinvar_vcf"]
     shell:
         """
-        vep -i {input} \
-        -o {output} \
-        --vcf \
-        --symbol \
-        --cache \
-        --offline
+        mkdir -p results/annotation logs/vep
+        /home/ndovie/miniconda3/envs/vep115_env/bin/vep \
+            -i {input} \
+            -o {output.vcf} \
+            --vcf \
+            --cache \
+            --offline \
+            --dir_cache {config[vep_cache]} \
+            --dir_plugins {config[vep_plugins_dir]} \
+            --assembly GRCh38 \
+            --symbol \
+            --everything \
+            --fork {threads} \
+            --stats_file {output.stats} \
+            --custom {params.clinvar},ClinVar,vcf,exact,0,CLNSIG,CLNSIGCONF,CLNREVSTAT,CLNDN \
+            --force_overwrite \
+            > {log} 2>&1
         """
 
+
 ############################################################
-# 11. PATHOGENIC VARIANT EXTRACTION
+# 12. DLBCL VARIANT PRIORITIZATION
+#     Uses: ClinVar pathogenicity, CADD score, REVEL score,
+#     AlphaMissense, HIGH impact variants, DLBCL driver genes
 ############################################################
 
-rule pathogenic:
+rule prioritize_variants:
     input:
-        "results/annotation/cohort.vep.vcf"
+        expand("results/annotation/{sample}.vep.vcf", sample=SAMPLES)
     output:
-        "results/annotation/pathogenic_variants.tsv"
-    run:
-        import pandas as pd
+        "results/prioritization/DLBCL_candidate_variants.tsv"
+    log: "logs/prioritization.log"
+    params:
+        genes=",".join(config["dlbcl_driver_genes"]),
+        cadd_min=config["thresholds"]["cadd_phred"],
+        revel_min=config["thresholds"]["revel"]
+    shell:
+        """
+        mkdir -p results/prioritization logs
+        python scripts/prioritize_variants.py \
+            --vcfs {input} \
+            --driver-genes "{params.genes}" \
+            --cadd-min {params.cadd_min} \
+            --revel-min {params.revel_min} \
+            --output {output} \
+            > {log} 2>&1
+        """
 
-        # simple extraction logic placeholder
-        with open(input[0]) as f:
-            lines = [l for l in f if "HIGH" in l or "MODERATE" in l]
-
-        with open(output[0], "w") as out:
-            out.write("\n".join(lines))
 
 ############################################################
-# 12. MULTIQC
+# 13. EXTRACT WILD-TYPE PROTEIN SEQUENCES
+#     e.g. TP53:p.Arg175His -> TP53 wild-type FASTA
+############################################################
+
+rule extract_protein_sequences:
+    input:
+        "results/prioritization/DLBCL_candidate_variants.tsv"
+    output:
+        flag="results/proteins/protein_sequences_done.flag",
+        fasta_dir=directory("results/proteins/wildtype")
+    log: "logs/protein/extract.log"
+    shell:
+        """
+        mkdir -p results/proteins/wildtype logs/protein
+        python scripts/extract_protein_sequences.py \
+            --variants {input} \
+            --output results/proteins/wildtype \
+            > {log} 2>&1
+        touch {output.flag}
+        """
+
+
+############################################################
+# 14. GENERATE MUTANT PROTEIN SEQUENCES
+#     e.g. TP53_R175.fasta -> TP53_R175H_mutant.fasta
+############################################################
+
+rule generate_mutant_sequences:
+    input:
+        variants="results/prioritization/DLBCL_candidate_variants.tsv",
+        flag="results/proteins/protein_sequences_done.flag"
+    output:
+        flag="results/mutant_proteins/mutant_sequences_done.flag",
+        fasta_dir=directory("results/mutant_proteins")
+    log: "logs/protein/mutate.log"
+    shell:
+        """
+        mkdir -p results/mutant_proteins logs/protein
+        python scripts/mutate_sequence.py \
+            --variants {input.variants} \
+            --wildtype results/proteins/wildtype \
+            --output results/mutant_proteins \
+            > {log} 2>&1
+        touch {output.flag}
+        """
+
+
+############################################################
+# 15. MULTIQC REPORT
 ############################################################
 
 rule multiqc:
     input:
-        "results/fastqc/"
+        expand("results/fastqc/{sample}_1_fastqc.html", sample=SAMPLES),
+        expand("results/fastqc/{sample}_2_fastqc.html", sample=SAMPLES),
+        expand("results/fastqc_trimmed/{sample}_1.paired_fastqc.html", sample=SAMPLES),
+        expand("results/fastqc_trimmed/{sample}_2.paired_fastqc.html", sample=SAMPLES),
+        expand("results/bam/{sample}.metrics.txt", sample=SAMPLES)
     output:
         "results/multiqc/multiqc_report.html"
+    log: "logs/multiqc.log"
     shell:
         """
-        multiqc results/ -o results/multiqc
+        mkdir -p results/multiqc
+        multiqc results/ -o results/multiqc > {log} 2>&1
+        """
+
+
+############################################################
+# 16. STRUCTURAL MODELLING PREPARATION
+#     Produces FASTA inputs for AlphaFold / ColabFold /
+#     SWISS-MODEL. Actual folding is run separately since it
+#     requires GPU.
+############################################################
+
+rule prepare_structure_inputs:
+    input:
+        wt="results/proteins/protein_sequences_done.flag",
+        mutant="results/mutant_proteins/mutant_sequences_done.flag"
+    output:
+        directory("results/structure_inputs")
+    shell:
+        """
+        mkdir -p results/structure_inputs
+        cp results/proteins/wildtype/*.fasta results/structure_inputs/
+        cp results/mutant_proteins/*.fasta results/structure_inputs/
+        touch results/structure_inputs/.done
         """
