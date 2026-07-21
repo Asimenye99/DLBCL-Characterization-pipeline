@@ -200,6 +200,18 @@ rule mark_duplicates:
 ############################################################
 # 6. MUTECT2 SOMATIC VARIANT CALLING (TUMOR ONLY)
 #    Designed for DLBCL tumor samples without matched normal
+#
+#    --af-of-alleles-not-in-resource is set explicitly because
+#    the GATK default (0.001) assumes a small germline resource.
+#    For a gnomAD-scale resource (~125,000+ samples) the
+#    documented recommendation is roughly 1 / (2 x N_samples),
+#    i.e. ~4e-6. Without this, Mutect2/FilterMutectCalls
+#    over-flags real somatic variants as "germline" -- an
+#    effect that is worse for cohorts under-represented in
+#    gnomAD (e.g. African-ancestry samples), since their
+#    variants are more likely to look "novel" against the
+#    reference panel. Override via config["mutect2"]["af_not_in_resource"]
+#    if your germline resource has a different sample count.
 ############################################################
 
 rule mutect2:
@@ -220,6 +232,9 @@ rule mutect2:
         pon=lambda wc: (
             f"--panel-of-normals {config['panel_of_normals']}"
             if config.get("panel_of_normals") else ""
+        ),
+        af_not_in_resource=config.get("mutect2", {}).get(
+            "af_not_in_resource", "4e-6"
         )
     shell:
         """
@@ -228,6 +243,7 @@ rule mutect2:
             -R {input.ref} \
             -I {input.bam} \
             --germline-resource {input.germline} \
+            --af-of-alleles-not-in-resource {params.af_not_in_resource} \
             {params.pon} \
             --f1r2-tar-gz {output.f1r2} \
             --native-pair-hmm-threads {threads} \
@@ -356,14 +372,20 @@ rule vep:
         vcf="results/annotation/{sample}.vep.vcf",
         stats="results/annotation/{sample}.vep_summary.html"
     threads: config["threads"]["vep"]
-    log: "logs/vep/{sample}.log"
-    benchmark: "benchmarks/vep/{sample}.txt"
+    log:
+        "logs/vep/{sample}.log"
+    benchmark:
+        "benchmarks/vep/{sample}.txt"
     params:
         clinvar=config["vep_plugins"]["clinvar_vcf"]
     shell:
         """
+        source ~/miniconda3/etc/profile.d/conda.sh
+        conda activate vep115_env
+
         mkdir -p results/annotation logs/vep
-        /home/ndovie/miniconda3/envs/vep115_env/bin/vep \
+
+        vep \
             -i {input} \
             -o {output.vcf} \
             --vcf \
@@ -372,7 +394,9 @@ rule vep:
             --dir_cache {config[vep_cache]} \
             --dir_plugins {config[vep_plugins_dir]} \
             --assembly GRCh38 \
+            --fasta reference/GRCh38.fa \
             --symbol \
+            --hgvs \
             --everything \
             --fork {threads} \
             --stats_file {output.stats} \
@@ -384,8 +408,15 @@ rule vep:
 
 ############################################################
 # 12. DLBCL VARIANT PRIORITIZATION
-#     Uses: ClinVar pathogenicity, CADD score, REVEL score,
-#     AlphaMissense, HIGH impact variants, DLBCL driver genes
+#     Uses: ClinVar pathogenicity, COSMIC, HIGH impact,
+#     and missense variants in DLBCL driver genes.
+#
+#     Runs PASS-only by default (script default is
+#     --include-filters PASS .). To additionally review
+#     non-PASS (e.g. germline-flagged) driver-gene variants
+#     for manual inspection, rerun the script directly with
+#     --include-filters PASS . germline -- do not do this
+#     for the main pipeline output.
 ############################################################
 
 rule prioritize_variants:
@@ -395,18 +426,15 @@ rule prioritize_variants:
         "results/prioritization/DLBCL_candidate_variants.tsv"
     log: "logs/prioritization.log"
     params:
-        genes=",".join(config["dlbcl_driver_genes"]),
-        cadd_min=config["thresholds"]["cadd_phred"],
-        revel_min=config["thresholds"]["revel"]
+        genes=",".join(config["dlbcl_driver_genes"])
     shell:
         """
         mkdir -p results/prioritization logs
         python scripts/prioritize_variants.py \
             --vcfs {input} \
             --driver-genes "{params.genes}" \
-            --cadd-min {params.cadd_min} \
-            --revel-min {params.revel_min} \
             --output {output} \
+            --include-filters PASS . germline \
             > {log} 2>&1
         """
 
