@@ -9,6 +9,9 @@
 
 reference: "reference/GRCh38.fa"
 
+gene_uniprot_map: "reference/gene_uniprot_map.tsv"
+canonical_ensp_map: "reference/canonical_ensp.tsv"
+
 # ------------------------------------------------------------
 # Mutect2 resources
 # ------------------------------------------------------------
@@ -22,63 +25,88 @@ common_variants: "reference/germline/small_exac_common_3.hg38.vcf.gz"
 # Optional Panel of Normals
 # Leave empty if not available
 panel_of_normals: ""
+
+
 # ------------------------------------------------------------
 # Computational resources
 # ------------------------------------------------------------
+
 threads:
-  fastqc: 4
+  fastqc: 2
   trimmomatic: 2
-  bwa: 16
-  gatk: 8
-  vep: 8
+  bwa: 8
+  gatk: 4
+  vep: 4
+
 
 # ------------------------------------------------------------
 # Trimmomatic
 # ------------------------------------------------------------
+
 trimmomatic:
   adapters: "reference/adapters/NexteraPE-PE.fa"
+
 
 # ------------------------------------------------------------
 # VEP configuration
 # ------------------------------------------------------------
-# IMPORTANT:
-# This is the directory ABOVE homo_sapiens/
-# NOT the 115_GRCh38 folder itself
+
+# Directory ABOVE homo_sapiens/
+# Contains:
+# reference/homo_sapiens/115_GRCh38/
 
 vep_cache: "reference"
 
 vep_plugins_dir: "reference/vep_plugins"
 
+
 # ------------------------------------------------------------
 # VEP plugins
 # ------------------------------------------------------------
+
 vep_plugins:
 
   # CADD
-  #cadd_snv: "reference/CADD/whole_genome_SNVs.tsv.gz"
-  #cadd_indels: "reference/CADD/InDels.tsv.gz"
+  cadd_snv: "reference/CADD/whole_genome_SNVs.tsv.gz"
+
+  # Uncomment only if you later download and prepare CADD indels
+  # cadd_indels: "reference/CADD/InDels.tsv.gz"
+
 
   # REVEL
-   #revel: "reference/REVEL/new_tabbed_revel_grch38.tsv.gz"
+  revel: "reference/REVEL/revel_GRCh38.tsv.gz"
+
 
   # AlphaMissense
-  #alphamissense: "reference/AlphaMissense/AlphaMissense_hg38.tsv.gz"
+  alphamissense: "reference/AlphaMissense/AlphaMissense_hg38.tsv.gz"
+
 
   # ClinVar
   clinvar_vcf: "reference/clinvar/clinvar_GRCh38.vcf.gz"
+
+
 # ------------------------------------------------------------
 # Variant prioritization thresholds
 # ------------------------------------------------------------
+
 thresholds:
 
   # CADD PHRED score cutoff
   cadd_phred: 20
 
-  # REVEL score cutoff
+  # REVEL pathogenicity cutoff
   revel: 0.5
+
+  # AlphaMissense classification threshold
+  # (used later during prioritization)
+  alphamissense_pathogenicity: 0.564
+
+foldx_bin: "/head/NFS/dndovi/DLBCL_Analysis/tools/foldx_20261231"
+
 # ------------------------------------------------------------
 # DLBCL driver genes
 # ------------------------------------------------------------
+
 dlbcl_driver_genes:
 
   - KMT2D
