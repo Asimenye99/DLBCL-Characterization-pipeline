@@ -12,6 +12,69 @@ def get_fastq(wc, read):
 
 
 ############################################################
+# GENE -> UNIPROT MAPPING (for protein structure modelling)
+#    Required columns: gene, uniprot_id
+#    This file must be supplied and verified by the user --
+#    UniProt accessions are NOT inferred automatically here,
+#    since a wrong accession would silently pull the wrong
+#    AlphaFold structure. Verify each entry at
+#    https://www.uniprot.org (search gene name + "human",
+#    use the reviewed/Swiss-Prot canonical entry).
+############################################################
+
+gene_uniprot_df = pd.read_csv(config["gene_uniprot_map"], sep="\t")
+
+gene_uniprot = (
+    gene_uniprot_df
+    .rename(columns=str.strip)
+    .set_index("gene")["uniprot_id"]
+    .to_dict()
+)
+
+############################################################
+# GENE -> CANONICAL ENSP MAPPING
+# Required columns:
+# gene    ensp
+#
+# These ENSP identifiers must correspond to the canonical
+# UniProt isoform downloaded from AlphaFold.
+############################################################
+
+canonical_ensp_df = pd.read_csv(
+    config["canonical_ensp_map"],
+    sep="\t"
+)
+
+canonical_ensp = (
+    canonical_ensp_df
+    .rename(columns=str.strip)
+    .set_index("gene")["ensp"]
+    .to_dict()
+)
+
+
+DLBCL_GENES = config["dlbcl_driver_genes"]
+   
+
+missing_map = [g for g in DLBCL_GENES if g not in gene_uniprot]
+
+if missing_map:
+    raise ValueError(
+        f"gene_uniprot_map is missing UniProt IDs for: {', '.join(missing_map)}.\n"
+        f"Please add them to {config['gene_uniprot_map']} before running the "
+        f"structural modelling workflow."
+    )
+
+missing_ensp = [g for g in DLBCL_GENES if g not in canonical_ensp]
+
+if missing_ensp:
+    raise ValueError(
+        f"canonical_ensp_map is missing ENSP IDs for: {', '.join(missing_ensp)}.\n"
+        f"Please update {config['canonical_ensp_map']}."
+    )
+
+
+############################################################
 # ALL TARGETS
 ############################################################
 
@@ -25,6 +88,28 @@ rule all:
         "results/proteins/protein_sequences_done.flag",
         "results/mutant_proteins/mutant_sequences_done.flag",
         "results/structure_inputs",
+        expand("results/structures/{gene}.pdb", gene=DLBCL_GENES),
+        expand(
+            "results/foldx/mutation_lists/{gene}_individual_list.txt",
+            gene=DLBCL_GENES
+        ),
+        expand(
+            "results/foldx/buildmodel/{gene}/Average_{gene}_Repair.fxout",
+            gene=DLBCL_GENES
+        ),
+
+        expand(
+            "results/foldx/repair/{gene}_Repair.pdb",
+            gene=DLBCL_GENES
+        ),
+
+        "results/structural_effects/DLBCL_structural_effects.tsv",
+        "results/pathways/string_network.tsv",
+        "results/pathways/reactome_enrichment.tsv",
+        "results/pathways/kegg_enrichment.tsv",
+        "results/pathways/go_enrichment.tsv",
+        "results/pathways/ppi_network.png",
+        "results/pathways/pathway_summary.html",
         "results/multiqc/multiqc_report.html"
 
 
@@ -368,21 +453,29 @@ rule normalize_vcf:
 rule vep:
     input:
         "results/mutect/{sample}.normalized.vcf.gz"
+
     output:
         vcf="results/annotation/{sample}.vep.vcf",
         stats="results/annotation/{sample}.vep_summary.html"
+
     threads: config["threads"]["vep"]
+
     log:
         "logs/vep/{sample}.log"
+
     benchmark:
         "benchmarks/vep/{sample}.txt"
+
     params:
         clinvar=config["vep_plugins"]["clinvar_vcf"]
+
     shell:
         """
-        source ~/miniconda3/etc/profile.d/conda.sh
+        module load Miniconda3/23.9.0-0
+        source $(conda info --base)/etc/profile.d/conda.sh
         conda activate vep115_env
-
+        
+        export PERL5LIB="$CONDA_PREFIX/share/ensembl-vep-115.2-1:${{PERL5LIB:-}}"
         mkdir -p results/annotation logs/vep
 
         vep \
@@ -396,11 +489,18 @@ rule vep:
             --assembly GRCh38 \
             --fasta reference/GRCh38.fa \
             --symbol \
+            --canonical \
+            --protein \
+            --hgvsp \
             --hgvs \
+            --pick \
             --everything \
             --fork {threads} \
             --stats_file {output.stats} \
             --custom {params.clinvar},ClinVar,vcf,exact,0,CLNSIG,CLNSIGCONF,CLNREVSTAT,CLNDN \
+            --plugin CADD,{config[vep_plugins][cadd_snv]} \
+            --plugin REVEL,{config[vep_plugins][revel]} \
+            --plugin AlphaMissense,file=reference/AlphaMissense/AlphaMissense_hg38.tsv.gz \
             --force_overwrite \
             > {log} 2>&1
         """
@@ -527,4 +627,397 @@ rule prepare_structure_inputs:
         cp results/proteins/wildtype/*.fasta results/structure_inputs/
         cp results/mutant_proteins/*.fasta results/structure_inputs/
         touch results/structure_inputs/.done
+        """
+
+
+############################################################
+# 17. FETCH ALPHAFOLD WILD-TYPE STRUCTURES
+#     One structure per DLBCL driver gene (canonical UniProt
+#     isoform), pulled from the AlphaFold DB. Requires
+#     internet access on the node running this rule.
+############################################################
+
+rule fetch_alphafold_structure:
+    output:
+        "results/structures/{gene}.pdb"
+    wildcard_constraints:
+        gene="[^/]+"
+    params:
+        uniprot=lambda wc: gene_uniprot[wc.gene],
+        url=lambda wc: (
+            f"https://alphafold.ebi.ac.uk/files/"
+            f"AF-{gene_uniprot[wc.gene]}-F1-model_v6.pdb"
+        )
+    log: "logs/alphafold/{gene}.log"
+    shell:
+        """
+        mkdir -p results/structures logs/alphafold
+        
+        if curl -fsSL {params.url} -o {output} 2> {log}; then
+            echo "Downloaded {wildcards.gene}" >> {log}
+        else
+            echo "No AlphaFold structure for {wildcards.gene}" > {log}
+            touch {output}
+        fi
+        """
+
+
+############################################################
+# 18. REPAIR STRUCTURES WITH FOLDX
+#     FoldX RepairPDB fixes clashes/torsion issues before
+#     BuildModel; required precursor for reliable ddG.
+#     rotabase.txt must sit alongside the PDB in the working
+#     directory FoldX is run from. - i did not use rotabase cause FOLDX5.1 does not have that
+############################################################
+
+rule foldx_repair_pdb:
+    input:
+        pdb="results/structures/{gene}.pdb"
+    output:
+        "results/foldx/repair/{gene}_Repair.pdb"
+    params:
+        foldx=config["foldx_bin"],
+        workdir="results/foldx/repair"
+    log:
+        "logs/foldx/{gene}.repair.log"
+    shell:
+        """
+        mkdir -p {params.workdir} logs/foldx
+
+        # Skip genes with no downloaded structure
+        if [ ! -s {input.pdb} ]; then
+            echo "No AlphaFold structure available for {wildcards.gene}. Skipping RepairPDB." > {log}
+            touch {output}
+            exit 0
+        fi
+
+        cp {input.pdb} {params.workdir}/
+
+        {params.foldx} --command=RepairPDB \
+            --pdb={wildcards.gene}.pdb \
+            --pdb-dir={params.workdir} \
+            --output-dir={params.workdir} \
+            > {log} 2>&1
+        """
+
+
+############################################################
+# 19. BUILD FOLDX MUTATION LISTS
+#     Converts prioritized HGVS protein changes (e.g.
+#     TP53:p.Arg175His) per gene into FoldX's individual_list
+#     format (e.g. "RA175H;"), one file per gene since a
+#     gene's variants share one structure.
+############################################################
+
+rule generate_foldx_mutation_list:
+    input:
+        variants="results/prioritization/DLBCL_candidate_variants.tsv",
+        canonical_map=config["canonical_ensp_map"]
+
+    output:
+        "results/foldx/mutation_lists/{gene}_individual_list.txt"
+
+    log:
+        "logs/foldx/{gene}.mutlist.log"
+
+    shell:
+        """
+        mkdir -p results/foldx/mutation_lists logs/foldx
+
+        python scripts/generate_foldx_mutation_list.py \
+            --variants {input.variants} \
+            --canonical-map {input.canonical_map} \
+            --gene {wildcards.gene} \
+            --gene-col GENE \
+            --protein-col HGVSp \
+            --chain A \
+            --output {output} \
+            > {log} 2>&1
+        """
+
+############################################################
+# 20. FOLDX BUILDMODEL
+#     Introduces each variant onto the repaired wild-type
+#     structure and reports ddG (kcal/mol) per mutation.
+#
+#     FoldX writes:
+#         Raw_*.fxout
+#         Dif_*.fxout
+#         Average_*.fxout
+#         PdbList_*.fxout
+#
+#     We explicitly track:
+#         - Average_*.fxout (used for ΔΔG analysis)
+#         - individual_list.txt (used to map FoldX output
+#           back to the original mutations)
+############################################################
+
+rule foldx_build_model:
+    input:
+        pdb="results/foldx/repair/{gene}_Repair.pdb",
+        mutlist="results/foldx/mutation_lists/{gene}_individual_list.txt"
+
+    output:
+        average="results/foldx/buildmodel/{gene}/Average_{gene}_Repair.fxout",
+        mutlist_copy="results/foldx/buildmodel/{gene}/individual_list.txt"
+
+    params:
+        foldx=config["foldx_bin"],
+        runs=config.get("foldx_num_runs", 5)
+
+    log:
+        "logs/foldx/{gene}.buildmodel.log"
+
+    shell:
+        r"""
+        OUTDIR=results/foldx/buildmodel/{wildcards.gene}
+
+        mkdir -p "$OUTDIR" logs/foldx
+
+        # Skip if no repaired structure exists
+        if [ ! -s "{input.pdb}" ]; then
+            echo "No repaired structure for {wildcards.gene}" > "{log}"
+            touch "{output.average}"
+            touch "{output.mutlist_copy}"
+            exit 0
+        fi
+
+        # Skip if there are no mutations
+        if [ ! -s "{input.mutlist}" ]; then
+            echo "No mutation list for {wildcards.gene}" > "{log}"
+            touch "{output.average}"
+            touch "{output.mutlist_copy}"
+            exit 0
+        fi
+
+        cp "{input.pdb}" "$OUTDIR/"
+        cp "{input.mutlist}" "{output.mutlist_copy}"
+
+        "{params.foldx}" \
+            --command=BuildModel \
+            --pdb={wildcards.gene}_Repair.pdb \
+            --pdb-dir="$OUTDIR" \
+            --mutant-file="{output.mutlist_copy}" \
+            --output-dir="$OUTDIR" \
+            --numberOfRuns={params.runs} \
+            > "{log}" 2>&1
+
+        test -f "{output.average}"
+        """
+
+
+############################################################
+# 21. CLASSIFY STRUCTURAL/STABILITY EFFECTS
+#     Parses FoldX Average_*.fxout files produced by
+#     BuildModel and classifies each mutation according to
+#     ΔΔG:
+#
+#       destabilizing : ΔΔG > 0.5 kcal/mol
+#       stabilizing   : ΔΔG < -0.5 kcal/mol
+#       neutral       : -0.5 <= ΔΔG <= 0.5 kcal/mol
+#
+#     The original FoldX mutation lists are used to map
+#     FoldX mutation IDs back to the corresponding variants.
+############################################################
+
+rule classify_stability:
+    input:
+        average_fxout=expand(
+            "results/foldx/buildmodel/{gene}/Average_{gene}_Repair.fxout",
+            gene=DLBCL_GENES
+        ),
+        mutation_lists=expand(
+            "results/foldx/mutation_lists/{gene}_individual_list.txt",
+            gene=DLBCL_GENES
+        )
+
+    output:
+        "results/structural_effects/DLBCL_structural_effects.tsv"
+
+    params:
+        genes=" ".join(DLBCL_GENES),
+        buildmodel_dir="results/foldx/buildmodel",
+        mutation_dir="results/foldx/mutation_lists",
+        destabilizing_threshold=0.5,
+        stabilizing_threshold=-0.5
+
+    log:
+        "logs/foldx/classify_stability.log"
+
+    shell:
+        """
+        mkdir -p results/structural_effects logs/foldx
+
+        python scripts/classify_ddg.py \
+            --buildmodel-dir {params.buildmodel_dir} \
+            --mutation-dir {params.mutation_dir} \
+            --genes {params.genes} \
+            --destabilizing-threshold {params.destabilizing_threshold} \
+            --stabilizing-threshold {params.stabilizing_threshold} \
+            --output {output} \
+            > {log} 2>&1
+        """
+        
+############################################################
+# 22. EXTRACT UNIQUE DLBCL GENES
+############################################################
+
+rule extract_gene_list:
+    input:
+        "results/prioritization/DLBCL_candidate_variants.tsv"
+
+    output:
+        "results/pathways/gene_list.txt"
+
+    log:
+        "logs/pathways/gene_list.log"
+
+    shell:
+        """
+        mkdir -p results/pathways logs/pathways
+
+        python scripts/extract_gene_list.py \
+            --input {input} \
+            --output {output} \
+            > {log} 2>&1
+        """
+        
+############################################################
+# 23. STRING PPI NETWORK
+############################################################
+
+rule string_network:
+    input:
+        "results/pathways/gene_list.txt"
+
+    output:
+        "results/pathways/string_network.tsv"
+
+    log:
+        "logs/pathways/string.log"
+
+    shell:
+        """
+        python scripts/string_network.py \
+            --genes {input} \
+            --output {output} \
+            > {log} 2>&1
+        """
+        
+############################################################
+# 24. REACTOME ENRICHMENT
+############################################################
+
+rule reactome_enrichment:
+    input:
+        "results/pathways/gene_list.txt"
+
+    output:
+        "results/pathways/reactome_enrichment.tsv"
+
+    log:
+        "logs/pathways/reactome.log"
+
+    shell:
+        """
+        python scripts/reactome_enrichment.py \
+            --genes {input} \
+            --output {output} \
+            > {log} 2>&1
+        """
+        
+############################################################
+# 25. KEGG ENRICHMENT
+############################################################
+
+rule kegg_enrichment:
+    input:
+        "results/pathways/gene_list.txt"
+
+    output:
+        "results/pathways/kegg_enrichment.tsv"
+
+    log:
+        "logs/pathways/kegg.log"
+
+    shell:
+        """
+        python scripts/kegg_enrichment.py \
+            --genes {input} \
+            --output {output} \
+            > {log} 2>&1
+        """
+        
+############################################################
+# 26. GO ENRICHMENT
+############################################################
+
+rule go_enrichment:
+    input:
+        "results/pathways/gene_list.txt"
+
+    output:
+        "results/pathways/go_enrichment.tsv"
+
+    log:
+        "logs/pathways/go.log"
+
+    shell:
+        """
+        python scripts/go_enrichment.py \
+            --genes {input} \
+            --output {output} \
+            > {log} 2>&1
+        """
+        
+############################################################
+# 27. DRAW STRING NETWORK
+############################################################
+
+rule draw_ppi_network:
+    input:
+        network="results/pathways/string_network.tsv"
+
+    output:
+        "results/pathways/ppi_network.png"
+
+    log:
+        "logs/pathways/network.log"
+
+    shell:
+        """
+        python scripts/draw_ppi_network.py \
+            --network {input.network} \
+            --output {output} \
+            > {log} 2>&1
+        """
+        
+############################################################
+# 28. BUILD HTML REPORT
+############################################################
+
+rule pathway_report:
+    input:
+        network="results/pathways/string_network.tsv",
+        reactome="results/pathways/reactome_enrichment.tsv",
+        kegg="results/pathways/kegg_enrichment.tsv",
+        go="results/pathways/go_enrichment.tsv",
+        figure="results/pathways/ppi_network.png"
+
+    output:
+        "results/pathways/pathway_summary.html"
+
+    log:
+        "logs/pathways/report.log"
+
+    shell:
+        """
+        python scripts/pathway_report.py \
+            --network {input.network} \
+            --reactome {input.reactome} \
+            --kegg {input.kegg} \
+            --go {input.go} \
+            --figure {input.figure} \
+            --output {output} \
+            > {log} 2>&1
         """
