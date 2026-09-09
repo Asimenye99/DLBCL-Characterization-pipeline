@@ -10,7 +10,7 @@
 reference: "reference/GRCh38.fa"
 
 gene_uniprot_map: "reference/gene_uniprot_map.tsv"
-canonical_ensp_map: "reference/canonical_ensp.tsv"
+canonical_ensp_map: "reference/ensembl_canonical_ensp.tsv"
 
 # ------------------------------------------------------------
 # Mutect2 resources
@@ -133,3 +133,15 @@ dlbcl_driver_genes:
   - FOXO1
   - CCND3
   - TBL1XR1
+  - BCL2
+  - MYC
+  - BCL7A
+  - BACH2
+  - IRF4
+  - CIITA
+  - CD74
+  - PAX5
+  - S1PR2
+  - BIRC3
+  - IRF8
+  - CARD11
