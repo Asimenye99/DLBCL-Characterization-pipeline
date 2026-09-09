@@ -534,7 +534,7 @@ rule prioritize_variants:
             --vcfs {input} \
             --driver-genes "{params.genes}" \
             --output {output} \
-            --include-filters PASS . germline \
+            --include-filters PASS . \
             > {log} 2>&1
         """
 
