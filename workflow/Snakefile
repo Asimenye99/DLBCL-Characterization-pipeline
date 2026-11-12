@@ -12,65 +12,57 @@ def get_fastq(wc, read):
 
 
 ############################################################
-# GENE -> UNIPROT MAPPING (for protein structure modelling)
-#    Required columns: gene, uniprot_id
-#    This file must be supplied and verified by the user --
-#    UniProt accessions are NOT inferred automatically here,
-#    since a wrong accession would silently pull the wrong
-#    AlphaFold structure. Verify each entry at
-#    https://www.uniprot.org (search gene name + "human",
-#    use the reviewed/Swiss-Prot canonical entry).
-############################################################
-
-gene_uniprot_df = pd.read_csv(config["gene_uniprot_map"], sep="\t")
-
-gene_uniprot = (
-    gene_uniprot_df
-    .rename(columns=str.strip)
-    .set_index("gene")["uniprot_id"]
-    .to_dict()
-)
-
-############################################################
-# GENE -> CANONICAL ENSP MAPPING
-# Required columns:
-# gene    ensp
+# GENE LISTS AND ID MAPS (derived from the data)
 #
-# These ENSP identifiers must correspond to the canonical
-# UniProt isoform downloaded from AlphaFold.
+# Variant calling and annotation are exome-wide; no gene panel filters
+# variants. Gene scope is applied downstream, after annotation:
+#   cancer-associated genes = COSMIC Cancer Gene Census (config: cosmic_census)
+#   DLBCL context           = Reddy et al. (2017) driver genes (IN_DLBCL_LIST)
+# Each variant is labelled GENE_SET = Both | Census_only | Reddy_only | Neither.
+# Candidate variants are pathogenic-evidence variants (Level 1-3) in genes of
+# the Census or the Reddy list. Gene membership is an annotation, never
+# evidence of pathogenicity. The genes to model structurally are derived by
+# the build_gene_maps checkpoint from the missense candidates, with UniProt
+# (VEP SWISSPROT) and canonical ENSP taken from VEP.
 ############################################################
 
-canonical_ensp_df = pd.read_csv(
-    config["canonical_ensp_map"],
-    sep="\t"
-)
+DLBCL_GENES = config["dlbcl_driver_genes"]   # Reddy et al. 2017 (annotation)
+CENSUS = config["cosmic_census"]             # COSMIC Cancer Gene Census CSV
 
-canonical_ensp = (
-    canonical_ensp_df
-    .rename(columns=str.strip)
-    .set_index("gene")["ensp"]
-    .to_dict()
-)
+PATHOGENIC_VARIANTS = "results/prioritization/pathogenic_variants.tsv"
+# Candidate variants: Level 1-3 evidence in a Census or Reddy gene
+CANDIDATE_VARIANTS = "results/prioritization/candidate_variants.tsv"
+# Truncating candidates (characterised separately; not FoldX input)
+TRUNCATING_VARIANTS = "results/prioritization/truncating_variants.tsv"
+FUNNEL = "results/prioritization/summary/funnel_summary.tsv"
+# Missense candidates (FoldX input): Level 1, plus Level 3 in Reddy or Census Tier 1 genes
+MODELLING_VARIANTS = "results/prioritization/modelling_variants.tsv"
+# Candidate rows in genes altered in >= pathway_min_samples patients (STRING/enrichment input)
+PATHWAY_VARIANTS = "results/prioritization/pathway_variants.tsv"
+GENE_LIST = "results/prioritization/modelling_genes.txt"
+UNIPROT_MAP = "results/prioritization/uniprot_map.tsv"
+ENSP_MAP = "results/prioritization/canonical_ensp_map.tsv"
 
 
-DLBCL_GENES = config["dlbcl_driver_genes"]
-   
+def modelled_genes(wildcards=None):
+    checkpoints.build_gene_maps.get()
+    with open(GENE_LIST) as fh:
+        return [line.strip() for line in fh if line.strip()]
 
-missing_map = [g for g in DLBCL_GENES if g not in gene_uniprot]
 
-if missing_map:
-    raise ValueError(
-        f"gene_uniprot_map is missing UniProt IDs for: {', '.join(missing_map)}.\n"
-        f"Please add them to {config['gene_uniprot_map']} before running the "
-        f"structural modelling workflow."
-    )
+def uniprot_of(gene):
+    checkpoints.build_gene_maps.get()
+    df = pd.read_csv(UNIPROT_MAP, sep="\t")
+    return df.set_index("gene")["uniprot_id"].to_dict()[gene]
 
-missing_ensp = [g for g in DLBCL_GENES if g not in canonical_ensp]
 
-if missing_ensp:
-    raise ValueError(
-        f"canonical_ensp_map is missing ENSP IDs for: {', '.join(missing_ensp)}.\n"
-        f"Please update {config['canonical_ensp_map']}."
+def structure_targets(wildcards):
+    genes = modelled_genes()
+    return (
+        expand("results/structures/{gene}.pdb", gene=genes)
+        + expand("results/foldx/mutation_lists/{gene}_individual_list.txt", gene=genes)
+        + expand("results/foldx/buildmodel/{gene}/Average_{gene}_Repair.fxout", gene=genes)
+        + expand("results/foldx/repair/{gene}_Repair.pdb", gene=genes)
     )
 
 
@@ -84,27 +76,25 @@ rule all:
         expand("results/mutect/{sample}.normalized.vcf.gz", sample=SAMPLES),
         expand("results/mutect/{sample}.normalized.vcf.gz.tbi", sample=SAMPLES),
         expand("results/annotation/{sample}.vep.vcf", sample=SAMPLES),
+        expand("results/haplotypecaller/{sample}.normalized.vcf.gz", sample=SAMPLES),
+        expand("results/haplotypecaller/{sample}.normalized.vcf.gz.tbi", sample=SAMPLES),
+        expand("results/annotation_hc/{sample}.vep.vcf", sample=SAMPLES),
         "results/prioritization/DLBCL_candidate_variants.tsv",
+        PATHOGENIC_VARIANTS,
+        MODELLING_VARIANTS,
+        PATHWAY_VARIANTS,
+        CANDIDATE_VARIANTS,
+        TRUNCATING_VARIANTS,
+        FUNNEL,
+        "results/pathways/background_genes.txt",
         "results/proteins/protein_sequences_done.flag",
         "results/mutant_proteins/mutant_sequences_done.flag",
         "results/structure_inputs",
-        expand("results/structures/{gene}.pdb", gene=DLBCL_GENES),
-        expand(
-            "results/foldx/mutation_lists/{gene}_individual_list.txt",
-            gene=DLBCL_GENES
-        ),
-        expand(
-            "results/foldx/buildmodel/{gene}/Average_{gene}_Repair.fxout",
-            gene=DLBCL_GENES
-        ),
-
-        expand(
-            "results/foldx/repair/{gene}_Repair.pdb",
-            gene=DLBCL_GENES
-        ),
+        structure_targets,
 
         "results/structural_effects/DLBCL_structural_effects.tsv",
         "results/pathways/string_network.tsv",
+        "results/pathways/network_analysis.tsv",
         "results/pathways/reactome_enrichment.tsv",
         "results/pathways/kegg_enrichment.tsv",
         "results/pathways/go_enrichment.tsv",
@@ -320,6 +310,10 @@ rule mutect2:
         ),
         af_not_in_resource=config.get("mutect2", {}).get(
             "af_not_in_resource", "4e-6"
+        ),
+        intervals=lambda wc: (
+            f"-L {config['target_intervals']} --interval-padding 100"
+            if config.get("target_intervals") else ""
         )
     shell:
         """
@@ -330,6 +324,7 @@ rule mutect2:
             --germline-resource {input.germline} \
             --af-of-alleles-not-in-resource {params.af_not_in_resource} \
             {params.pon} \
+            {params.intervals} \
             --f1r2-tar-gz {output.f1r2} \
             --native-pair-hmm-threads {threads} \
             -O {output.vcf} \
@@ -507,34 +502,357 @@ rule vep:
 
 
 ############################################################
-# 12. DLBCL VARIANT PRIORITIZATION
-#     Uses: ClinVar pathogenicity, COSMIC, HIGH impact,
-#     and missense variants in DLBCL driver genes.
+# 11A. HAPLOTYPECALLER (GERMLINE-STYLE CALLING ON THE TUMOR BAM)
 #
-#     Runs PASS-only by default (script default is
-#     --include-filters PASS .). To additionally review
-#     non-PASS (e.g. germline-flagged) driver-gene variants
-#     for manual inspection, rerun the script directly with
-#     --include-filters PASS . germline -- do not do this
-#     for the main pipeline output.
+#      Complements Mutect2. HaplotypeCaller is a germline
+#      caller: it reports variants of all origins present in
+#      the tumor sample and cannot tell germline from somatic
+#      without a matched normal, so its calls are labelled
+#      "Unresolved" downstream. Mutect2 remains the source of
+#      the putative-somatic / germline-flagged inference.
+#
+#      Optional config key:
+#          target_intervals   exome capture BED / interval_list.
+#                             Strongly recommended: without it
+#                             the whole reference is traversed.
+#                             A 100 bp padding is applied.
+############################################################
+
+rule haplotypecaller:
+    input:
+        bam="results/bam/{sample}.marked.bam",
+        bai="results/bam/{sample}.marked.bam.bai",
+        ref=config["reference"],
+        fai=config["reference"] + ".fai",
+        seq_dict=os.path.splitext(config["reference"])[0] + ".dict"
+    output:
+        vcf="results/haplotypecaller/{sample}.raw.vcf.gz",
+        tbi="results/haplotypecaller/{sample}.raw.vcf.gz.tbi"
+    threads: config["threads"]["gatk"]
+    log: "logs/haplotypecaller/{sample}.log"
+    benchmark: "benchmarks/haplotypecaller/{sample}.txt"
+    params:
+        intervals=lambda wc: (
+            f"-L {config['target_intervals']} --interval-padding 100"
+            if config.get("target_intervals") else ""
+        )
+    shell:
+        """
+        mkdir -p results/haplotypecaller logs/haplotypecaller
+        gatk HaplotypeCaller \
+            -R {input.ref} \
+            -I {input.bam} \
+            {params.intervals} \
+            --native-pair-hmm-threads {threads} \
+            -O {output.vcf} \
+            > {log} 2>&1
+        """
+
+
+############################################################
+# 11B. HARD-FILTER HAPLOTYPECALLER CALLS
+#      VQSR is not suitable for a small number of exomes, so
+#      GATK's recommended hard filters are applied separately
+#      to SNPs and indels, then merged. Failing calls are
+#      labelled in the FILTER column (not removed); the
+#      prioritisation script accepts only PASS / '.'.
+#      MNP and mixed-type records are not selected and are
+#      therefore not carried forward.
+#      Thresholds follow GATK's germline hard-filter
+#      guidance; adjust if justified by the data.
+############################################################
+
+rule filter_haplotypecaller:
+    input:
+        vcf="results/haplotypecaller/{sample}.raw.vcf.gz",
+        tbi="results/haplotypecaller/{sample}.raw.vcf.gz.tbi",
+        ref=config["reference"],
+        fai=config["reference"] + ".fai",
+        seq_dict=os.path.splitext(config["reference"])[0] + ".dict"
+    output:
+        vcf="results/haplotypecaller/{sample}.filtered.vcf.gz",
+        tbi="results/haplotypecaller/{sample}.filtered.vcf.gz.tbi"
+    log: "logs/haplotypecaller/{sample}.filter.log"
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p results/haplotypecaller logs/haplotypecaller
+        exec > {log} 2>&1
+
+        TMP=results/haplotypecaller/{wildcards.sample}
+
+        gatk SelectVariants \
+            -R {input.ref} -V {input.vcf} \
+            --select-type-to-include SNP \
+            -O ${{TMP}}.snps.vcf.gz
+
+        gatk SelectVariants \
+            -R {input.ref} -V {input.vcf} \
+            --select-type-to-include INDEL \
+            -O ${{TMP}}.indels.vcf.gz
+
+        gatk VariantFiltration \
+            -R {input.ref} -V ${{TMP}}.snps.vcf.gz \
+            --filter-name "SNP_QUAL30"   --filter-expression "QUAL < 30.0" \
+            --filter-name "SNP_QD2"      --filter-expression "QD < 2.0" \
+            --filter-name "SNP_FS60"     --filter-expression "FS > 60.0" \
+            --filter-name "SNP_SOR3"     --filter-expression "SOR > 3.0" \
+            --filter-name "SNP_MQ40"     --filter-expression "MQ < 40.0" \
+            --filter-name "SNP_MQRS-12.5" --filter-expression "MQRankSum < -12.5" \
+            --filter-name "SNP_RPRS-8"   --filter-expression "ReadPosRankSum < -8.0" \
+            -O ${{TMP}}.snps.filtered.vcf.gz
+
+        gatk VariantFiltration \
+            -R {input.ref} -V ${{TMP}}.indels.vcf.gz \
+            --filter-name "INDEL_QUAL30" --filter-expression "QUAL < 30.0" \
+            --filter-name "INDEL_QD2"    --filter-expression "QD < 2.0" \
+            --filter-name "INDEL_FS200"  --filter-expression "FS > 200.0" \
+            --filter-name "INDEL_SOR10"  --filter-expression "SOR > 10.0" \
+            --filter-name "INDEL_RPRS-20" --filter-expression "ReadPosRankSum < -20.0" \
+            -O ${{TMP}}.indels.filtered.vcf.gz
+
+        gatk MergeVcfs \
+            -I ${{TMP}}.snps.filtered.vcf.gz \
+            -I ${{TMP}}.indels.filtered.vcf.gz \
+            -O {output.vcf}
+
+        rm -f ${{TMP}}.snps.vcf.gz ${{TMP}}.snps.vcf.gz.tbi \
+              ${{TMP}}.indels.vcf.gz ${{TMP}}.indels.vcf.gz.tbi \
+              ${{TMP}}.snps.filtered.vcf.gz ${{TMP}}.snps.filtered.vcf.gz.tbi \
+              ${{TMP}}.indels.filtered.vcf.gz ${{TMP}}.indels.filtered.vcf.gz.tbi
+        """
+
+
+############################################################
+# 11C. NORMALIZE HAPLOTYPECALLER VARIANTS
+############################################################
+
+rule normalize_haplotypecaller:
+    input:
+        vcf="results/haplotypecaller/{sample}.filtered.vcf.gz",
+        ref=config["reference"],
+        fai=config["reference"] + ".fai"
+    output:
+        vcf="results/haplotypecaller/{sample}.normalized.vcf.gz",
+        tbi="results/haplotypecaller/{sample}.normalized.vcf.gz.tbi"
+    log: "logs/bcftools/{sample}.hc.norm.log"
+    shell:
+        """
+        mkdir -p logs/bcftools
+        bcftools norm -f {input.ref} -m -both {input.vcf} -Oz -o {output.vcf} > {log} 2>&1
+        tabix -p vcf {output.vcf}
+        """
+
+
+############################################################
+# 11D. VEP ANNOTATION OF HAPLOTYPECALLER VARIANTS
+#      Identical options to rule vep (keep the two in sync);
+#      output goes to results/annotation_hc/ so that sample
+#      names are preserved and the two callers stay separate
+#      until the prioritisation step.
+############################################################
+
+rule vep_haplotypecaller:
+    input:
+        "results/haplotypecaller/{sample}.normalized.vcf.gz"
+
+    output:
+        vcf="results/annotation_hc/{sample}.vep.vcf",
+        stats="results/annotation_hc/{sample}.vep_summary.html"
+
+    threads: config["threads"]["vep"]
+
+    log:
+        "logs/vep/{sample}.hc.log"
+
+    benchmark:
+        "benchmarks/vep/{sample}.hc.txt"
+
+    params:
+        clinvar=config["vep_plugins"]["clinvar_vcf"]
+
+    shell:
+        """
+        module load Miniconda3/23.9.0-0
+        source $(conda info --base)/etc/profile.d/conda.sh
+        conda activate vep115_env
+        
+        export PERL5LIB="$CONDA_PREFIX/share/ensembl-vep-115.2-1:${{PERL5LIB:-}}"
+        mkdir -p results/annotation_hc logs/vep
+
+        vep \
+            -i {input} \
+            -o {output.vcf} \
+            --vcf \
+            --cache \
+            --offline \
+            --dir_cache {config[vep_cache]} \
+            --dir_plugins {config[vep_plugins_dir]} \
+            --assembly GRCh38 \
+            --fasta reference/GRCh38.fa \
+            --symbol \
+            --canonical \
+            --protein \
+            --hgvsp \
+            --hgvs \
+            --pick \
+            --everything \
+            --fork {threads} \
+            --stats_file {output.stats} \
+            --custom {params.clinvar},ClinVar,vcf,exact,0,CLNSIG,CLNSIGCONF,CLNREVSTAT,CLNDN \
+            --plugin CADD,{config[vep_plugins][cadd_snv]} \
+            --plugin REVEL,{config[vep_plugins][revel]} \
+            --plugin AlphaMissense,file=reference/AlphaMissense/AlphaMissense_hg38.tsv.gz \
+            --force_overwrite \
+            > {log} 2>&1
+        """
+
+
+############################################################
+# 12. VARIANT PRIORITIZATION (GERMLINE AND SOMATIC)
+#     Exome-wide: every protein-altering variant in any gene is
+#     annotated and tiered. The Census (IN_CGC, CGC_TIER) and Reddy
+#     (IN_DLBCL_LIST) lists only label genes (GENE_SET); candidates
+#     are variants with Level 1-3 evidence in either list. Evidence:
+#     ClinVar pathogenicity, HIGH impact and computational predictors.
+#
+#     Outputs:
+#       DLBCL_candidate_variants.tsv  all protein-altering variants
+#                                     passing FILTER and --max-af
+#       pathogenic_variants.tsv       rows with pathogenic evidence
+#                                     (ClinVar P/LP, HIGH-impact LoF,
+#                                     or CADD/REVEL/AlphaMissense)
+#
+#     Inputs:
+#       Mutect2 calls        FILTER PASS / . / germline
+#       HaplotypeCaller      FILTER PASS / . (hard-filtered),
+#                            ORIGIN=Unresolved unless Mutect2 agrees.
+#     Variants found by both callers are merged into one row.
+#     --max-af removes common variants unless ClinVar reports
+#     pathogenic/likely pathogenic (config["max_af"], default 0.01).
 ############################################################
 
 rule prioritize_variants:
     input:
-        expand("results/annotation/{sample}.vep.vcf", sample=SAMPLES)
+        mutect=expand("results/annotation/{sample}.vep.vcf", sample=SAMPLES),
+        hc=expand("results/annotation_hc/{sample}.vep.vcf", sample=SAMPLES),
+        census=CENSUS
     output:
-        "results/prioritization/DLBCL_candidate_variants.tsv"
+        candidates="results/prioritization/DLBCL_candidate_variants.tsv",
+        pathogenic=PATHOGENIC_VARIANTS,
+        modelling=MODELLING_VARIANTS,
+        pathway=PATHWAY_VARIANTS,
+        candidates_primary=CANDIDATE_VARIANTS,
+        truncating=TRUNCATING_VARIANTS
     log: "logs/prioritization.log"
     params:
-        genes=",".join(config["dlbcl_driver_genes"])
+        flag_genes=",".join(config["dlbcl_driver_genes"]),
+        max_af=config.get("max_af", 0.01),
+        cadd=config["thresholds"]["cadd_phred"],
+        revel=config["thresholds"]["revel"],
+        am=config["thresholds"]["alphamissense_pathogenicity"],
+        min_predictors=config.get("min_predictors", 1),
+        census_tiers=" ".join(str(t) for t in config.get("modelling_census_tiers", [1])),
+        levels=" ".join(str(l) for l in config.get("candidate_levels", [1])),
+        pathway_min_samples=config.get("pathway_min_samples", 1)
     shell:
         """
         mkdir -p results/prioritization logs
         python scripts/prioritize_variants.py \
-            --vcfs {input} \
-            --driver-genes "{params.genes}" \
-            --output {output} \
-            --include-filters PASS . \
+            --vcfs {input.mutect} \
+            --hc-vcfs {input.hc} \
+            --flag-genes "{params.flag_genes}" \
+            --census {input.census} \
+            --modelling-census-tiers {params.census_tiers} \
+            --candidate-levels {params.levels} \
+            --candidate-output {output.candidates_primary} \
+            --truncating-output {output.truncating} \
+            --output {output.candidates} \
+            --pathogenic-output {output.pathogenic} \
+            --modelling-output {output.modelling} \
+            --pathway-output {output.pathway} \
+            --pathway-min-samples {params.pathway_min_samples} \
+            --include-filters PASS . germline \
+            --hc-include-filters PASS . \
+            --max-af {params.max_af} \
+            --cadd-phred {params.cadd} \
+            --revel {params.revel} \
+            --alphamissense {params.am} \
+            --min-predictors {params.min_predictors} \
+            > {log} 2>&1
+        """
+
+
+############################################################
+# 12B. FUNNEL COUNTS, GENE-SET OVERLAP, CANDIDATE VARIANT TABLE
+############################################################
+
+rule candidate_summary:
+    input:
+        allv="results/prioritization/DLBCL_candidate_variants.tsv",
+        pathogenic=PATHOGENIC_VARIANTS,
+        census=CENSUS
+    output:
+        FUNNEL,
+        "results/prioritization/summary/gene_set_overlap.tsv",
+        "results/prioritization/summary/candidate_genes.tsv",
+        "results/prioritization/summary/candidate_variant_table.tsv"
+    params:
+        reddy=",".join(config["dlbcl_driver_genes"]),
+        levels=" ".join(str(l) for l in config.get("candidate_levels", [1]))
+    log: "logs/candidate_summary.log"
+    shell:
+        """
+        python scripts/candidate_summary.py \
+            --all-variants {input.allv} --pathogenic {input.pathogenic} \
+            --census {input.census} --reddy-genes "{params.reddy}" \
+            --levels {params.levels} \
+            --outdir results/prioritization/summary > {log} 2>&1
+        """
+
+
+rule enrichment_background:
+    input:
+        census=CENSUS
+    output:
+        "results/pathways/background_genes.txt",
+        "results/pathways/reddy_genes.txt"
+    params:
+        reddy=",".join(config["dlbcl_driver_genes"])
+    log: "logs/pathways/background.log"
+    shell:
+        """
+        mkdir -p results/pathways logs/pathways
+        python scripts/build_background.py --census {input.census} \
+            --reddy-genes "{params.reddy}" --output {output[0]} \
+            --reddy-output {output[1]} > {log} 2>&1
+        """
+
+
+############################################################
+# 12A. GENES, UNIPROT AND ENSP MAPS FOR STRUCTURAL MODELLING
+#      Checkpoint: the set of genes is only known after
+#      prioritisation. Genes with missense variants that cannot be
+#      mapped are listed in unmapped_genes.tsv, not dropped silently.
+############################################################
+
+checkpoint build_gene_maps:
+    input:
+        MODELLING_VARIANTS
+    output:
+        genes=GENE_LIST,
+        uniprot=UNIPROT_MAP,
+        ensp=ENSP_MAP,
+        unmapped="results/prioritization/unmapped_genes.tsv"
+    log: "logs/prioritization.maps.log"
+    shell:
+        """
+        python scripts/build_gene_maps.py \
+            --variants {input} \
+            --genes {output.genes} \
+            --uniprot-map {output.uniprot} \
+            --ensp-map {output.ensp} \
+            --unmapped {output.unmapped} \
             > {log} 2>&1
         """
 
@@ -546,7 +864,7 @@ rule prioritize_variants:
 
 rule extract_protein_sequences:
     input:
-        "results/prioritization/DLBCL_candidate_variants.tsv"
+        MODELLING_VARIANTS
     output:
         flag="results/proteins/protein_sequences_done.flag",
         fasta_dir=directory("results/proteins/wildtype")
@@ -569,7 +887,7 @@ rule extract_protein_sequences:
 
 rule generate_mutant_sequences:
     input:
-        variants="results/prioritization/DLBCL_candidate_variants.tsv",
+        variants=MODELLING_VARIANTS,
         flag="results/proteins/protein_sequences_done.flag"
     output:
         flag="results/mutant_proteins/mutant_sequences_done.flag",
@@ -643,21 +961,33 @@ rule fetch_alphafold_structure:
     wildcard_constraints:
         gene="[^/]+"
     params:
-        uniprot=lambda wc: gene_uniprot[wc.gene],
+        uniprot=lambda wc: uniprot_of(wc.gene),
         url=lambda wc: (
             f"https://alphafold.ebi.ac.uk/files/"
-            f"AF-{gene_uniprot[wc.gene]}-F1-model_v6.pdb"
+            f"AF-{uniprot_of(wc.gene)}-F1-model_v6.pdb"
         )
     log: "logs/alphafold/{gene}.log"
     shell:
         """
         mkdir -p results/structures logs/alphafold
-        
-        if curl -fsSL {params.url} -o {output} 2> {log}; then
-            echo "Downloaded {wildcards.gene}" >> {log}
+
+        # The AlphaFold file server returns HTTP 403 to curl's default
+        # user agent, so a browser-style agent is sent. Only HTTP 404 (no
+        # model in AlphaFold DB, e.g. proteins too large for one model) is
+        # accepted as "no structure"; any other failure stops the run
+        # instead of silently writing an empty file.
+        code=$(curl -sSL -A "Mozilla/5.0" --retry 3 --retry-delay 5 \
+                   -o {output} -w "%{{http_code}}" {params.url} 2> {log} || true)
+
+        if [ "$code" = "200" ] && [ -s {output} ]; then
+            echo "Downloaded {wildcards.gene} from {params.url}" >> {log}
+        elif [ "$code" = "404" ]; then
+            echo "NOT_IN_ALPHAFOLD {wildcards.gene} ({params.url}, HTTP 404)" >> {log}
+            : > {output}
         else
-            echo "No AlphaFold structure for {wildcards.gene}" > {log}
-            touch {output}
+            echo "ERROR: HTTP $code for {wildcards.gene} ({params.url})" >> {log}
+            rm -f {output}
+            exit 1
         fi
         """
 
@@ -711,8 +1041,9 @@ rule foldx_repair_pdb:
 
 rule generate_foldx_mutation_list:
     input:
-        variants="results/prioritization/DLBCL_candidate_variants.tsv",
-        canonical_map=config["canonical_ensp_map"]
+        variants=MODELLING_VARIANTS,
+        canonical_map=ENSP_MAP,
+        pdb="results/structures/{gene}.pdb"
 
     output:
         "results/foldx/mutation_lists/{gene}_individual_list.txt"
@@ -733,6 +1064,16 @@ rule generate_foldx_mutation_list:
             --chain A \
             --output {output} \
             > {log} 2>&1
+
+        # Drop mutations whose wild-type residue is not in the AlphaFold
+        # structure (isoform/numbering mismatch); they are listed in
+        # results/foldx/unmodelled/{wildcards.gene}.tsv and reported as not modelled.
+        # (Not a declared output, so existing genes are not re-run.)
+        mkdir -p results/foldx/unmodelled
+        python scripts/filter_foldx_mutations.py \
+            --pdb {input.pdb} --mutlist {output} \
+            --unmodelled results/foldx/unmodelled/{wildcards.gene}.tsv --gene {wildcards.gene} \
+            >> {log} 2>&1
         """
 
 ############################################################
@@ -822,20 +1163,20 @@ rule foldx_build_model:
 
 rule classify_stability:
     input:
-        average_fxout=expand(
+        average_fxout=lambda wc: expand(
             "results/foldx/buildmodel/{gene}/Average_{gene}_Repair.fxout",
-            gene=DLBCL_GENES
+            gene=modelled_genes()
         ),
-        mutation_lists=expand(
+        mutation_lists=lambda wc: expand(
             "results/foldx/mutation_lists/{gene}_individual_list.txt",
-            gene=DLBCL_GENES
+            gene=modelled_genes()
         )
 
     output:
         "results/structural_effects/DLBCL_structural_effects.tsv"
 
     params:
-        genes=" ".join(DLBCL_GENES),
+        genes=lambda wc: " ".join(modelled_genes()),
         buildmodel_dir="results/foldx/buildmodel",
         mutation_dir="results/foldx/mutation_lists",
         destabilizing_threshold=0.5,
@@ -859,12 +1200,12 @@ rule classify_stability:
         """
         
 ############################################################
-# 22. EXTRACT UNIQUE DLBCL GENES
+# 22. EXTRACT UNIQUE CANDIDATE GENES
 ############################################################
 
 rule extract_gene_list:
     input:
-        "results/prioritization/DLBCL_candidate_variants.tsv"
+        PATHWAY_VARIANTS
 
     output:
         "results/pathways/gene_list.txt"
@@ -888,10 +1229,12 @@ rule extract_gene_list:
 
 rule string_network:
     input:
-        "results/pathways/gene_list.txt"
+        genes="results/pathways/gene_list.txt",
+        reddy="results/pathways/reddy_genes.txt"
 
     output:
-        "results/pathways/string_network.tsv"
+        "results/pathways/string_network.tsv",
+        context="results/pathways/string_network_context.tsv"
 
     log:
         "logs/pathways/string.log"
@@ -899,8 +1242,10 @@ rule string_network:
     shell:
         """
         python scripts/string_network.py \
-            --genes {input} \
-            --output {output} \
+            --genes {input.genes} \
+            --context-genes {input.reddy} \
+            --context-output {output.context} \
+            --output {output[0]} \
             > {log} 2>&1
         """
         
@@ -910,7 +1255,10 @@ rule string_network:
 
 rule reactome_enrichment:
     input:
-        "results/pathways/gene_list.txt"
+        genes="results/pathways/gene_list.txt",
+        background="results/pathways/background_genes.txt"
+    params:
+        bg=lambda wc, input: (f"--background {input.background}" if config.get("enrichment_custom_background", False) else "")
 
     output:
         "results/pathways/reactome_enrichment.tsv"
@@ -921,7 +1269,8 @@ rule reactome_enrichment:
     shell:
         """
         python scripts/reactome_enrichment.py \
-            --genes {input} \
+            --genes {input.genes} \
+            {params.bg} \
             --output {output} \
             > {log} 2>&1
         """
@@ -932,7 +1281,10 @@ rule reactome_enrichment:
 
 rule kegg_enrichment:
     input:
-        "results/pathways/gene_list.txt"
+        genes="results/pathways/gene_list.txt",
+        background="results/pathways/background_genes.txt"
+    params:
+        bg=lambda wc, input: (f"--background {input.background}" if config.get("enrichment_custom_background", False) else "")
 
     output:
         "results/pathways/kegg_enrichment.tsv"
@@ -943,7 +1295,8 @@ rule kegg_enrichment:
     shell:
         """
         python scripts/kegg_enrichment.py \
-            --genes {input} \
+            --genes {input.genes} \
+            {params.bg} \
             --output {output} \
             > {log} 2>&1
         """
@@ -954,7 +1307,10 @@ rule kegg_enrichment:
 
 rule go_enrichment:
     input:
-        "results/pathways/gene_list.txt"
+        genes="results/pathways/gene_list.txt",
+        background="results/pathways/background_genes.txt"
+    params:
+        bg=lambda wc, input: (f"--background {input.background}" if config.get("enrichment_custom_background", False) else "")
 
     output:
         "results/pathways/go_enrichment.tsv"
@@ -965,11 +1321,40 @@ rule go_enrichment:
     shell:
         """
         python scripts/go_enrichment.py \
-            --genes {input} \
+            --genes {input.genes} \
+            {params.bg} \
             --output {output} \
             > {log} 2>&1
         """
         
+############################################################
+# 26A. NETWORK CONTEXT OF CANDIDATE GENES
+#      Connectivity (degree, betweenness, hubs), association with
+#      Reddy DLBCL drivers and FoldX class per gene. Describes
+#      network context only; it does not show variant-induced
+#      changes in interactions.
+############################################################
+
+rule network_analysis:
+    input:
+        network="results/pathways/string_network.tsv",
+        context="results/pathways/string_network_context.tsv",
+        genes="results/prioritization/summary/candidate_genes.tsv",
+        structural="results/structural_effects/DLBCL_structural_effects.tsv"
+    output:
+        "results/pathways/network_analysis.tsv"
+    params:
+        reddy=",".join(config["dlbcl_driver_genes"])
+    log: "logs/pathways/network_analysis.log"
+    shell:
+        """
+        python scripts/network_analysis.py \
+            --network {input.network} --context-network {input.context} \
+            --candidate-genes {input.genes} --reddy-genes "{params.reddy}" \
+            --structural {input.structural} --output {output} > {log} 2>&1
+        """
+
+
 ############################################################
 # 27. DRAW STRING NETWORK
 ############################################################
